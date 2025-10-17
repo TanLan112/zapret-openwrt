@@ -1,147 +1,108 @@
 #!/bin/sh /etc/rc.common
 # Copyright (c) 2024 remittor
-# Modified by Tanlan (2025) — добавлена проверка доступности сети и автоконтроль zapret
+# Modified by TanLan for smarter boot/hotplug sync
 
 USE_PROCD=1
-# after network
 START=21
+STOP=89
 
+EXEDIR=/opt/zapret
+ZAPRET_BASE=/opt/zapret
 SCRIPT_FILENAME=$1
 
 . /opt/zapret/comfunc.sh
 
-if ! is_valid_config ; then
-	logger -p err -t ZAPRET "Wrong main config: $ZAPRET_CONFIG"
-	exit 91
+if ! is_valid_config; then
+    logger -p err -t ZAPRET "Wrong main config: $ZAPRET_CONFIG"
+    exit 91
 fi
 
 . $ZAPRET_ORIG_INITD
 
-EXEDIR=/opt/zapret
-ZAPRET_BASE=/opt/zapret
-
 is_run_on_boot && IS_RUN_ON_BOOT=1 || IS_RUN_ON_BOOT=0
 
+# === helper: check if WAN is up ===
+is_inet_ready() {
+    local iface=$(uci get network.wan.ifname 2>/dev/null)
+    [ -z "$iface" ] && iface=$(uci get network.@interface[0].ifname 2>/dev/null)
+    [ -z "$iface" ] && return 1
 
-# ---------- новые функции ----------
+    # check IPv4 connectivity
+    local has_v4=$(ip -4 addr show dev "$iface" | grep -q "inet " && echo 1)
+    # check IPv6 connectivity (delayed)
+    local has_v6=$(ip -6 addr show dev "$iface" | grep -q "inet6 " && echo 1)
 
-get_iface() {
-	local IFACE
-	IFACE="$(uci -q get network.wan.ifname 2>/dev/null)"
-	[ -z "$IFACE" ] && IFACE="$(uci -q get network.internet.ifname 2>/dev/null)"
-	[ -z "$IFACE" ] && IFACE="$(uci -q get network.@interface[0].ifname 2>/dev/null)"
-	[ -z "$IFACE" ] && IFACE="pppoe-wan"
-	echo "$IFACE"
+    [ "$has_v4" = "1" ] || [ "$has_v6" = "1" ]
 }
 
-wait_for_internet() {
-	local IFACE="$(get_iface)"
-	local WAIT_SECS=0
-	local MAX_WAIT=60
-	logger -t ZAPRET "Ожидание появления интернет-соединения на интерфейсе $IFACE..."
+# === helper: wait for real internet connectivity ===
+wait_for_inet() {
+    local timeout=30
+    local waited=0
+    logger -t ZAPRET "Waiting for network to be ready..."
 
-	while [ $WAIT_SECS -lt $MAX_WAIT ]; do
-		if ping -c1 -W2 -I "$IFACE" 1.1.1.1 >/dev/null 2>&1; then
-			logger -t ZAPRET "Интернет IPv4 доступен."
-			break
-		fi
-		sleep 3
-		WAIT_SECS=$((WAIT_SECS + 3))
-	done
+    while [ $waited -lt $timeout ]; do
+        if is_inet_ready; then
+            logger -t ZAPRET "Network ready after $waited seconds."
+            return 0
+        fi
+        sleep 2
+        waited=$((waited + 2))
+    done
 
-	# дополнительная задержка для IPv6
-	sleep 5
-	logger -t ZAPRET "Проверка IPv6..."
-	if ping6 -c1 -W2 -I "$IFACE" 2606:4700:4700::1111 >/dev/null 2>&1; then
-		logger -t ZAPRET "Интернет IPv6 доступен."
-	else
-		logger -t ZAPRET "IPv6 не отвечает, продолжаем запуск."
-	fi
+    logger -p warn -t ZAPRET "Network not ready after $timeout seconds, starting anyway."
 }
 
-monitor_internet() {
-	local IFACE="$(get_iface)"
-	while true; do
-		if ping -c1 -W2 -I "$IFACE" 1.1.1.1 >/dev/null 2>&1; then
-			sleep 15
-			continue
-		else
-			logger -p notice -t ZAPRET "Интернет потерян — останавливаю zapret."
-			/etc/init.d/zapret stop
-
-			# ждём восстановления
-			while ! ping -c1 -W2 -I "$IFACE" 1.1.1.1 >/dev/null 2>&1; do
-				sleep 5
-			done
-
-			logger -t ZAPRET "Интернет восстановлен — перезапускаю zapret."
-			/etc/init.d/zapret start
-		fi
-	done &
+# === standard OpenWrt service handlers ===
+enable() {
+    /bin/sh /etc/rc.common $ZAPRET_ORIG_INITD enable
 }
 
-
-# ---------- оригинальные функции ----------
-
-function enable {
-	local run_on_boot=""
-	patch_luci_header_ut
-	if [ "$IS_RUN_ON_BOOT" = "1" ]; then
-		if [ -n "$ZAPRET_CFG_SEC_NAME" ]; then
-			run_on_boot=$( get_run_on_boot_option )
-			if [ $run_on_boot != 1 ]; then
-				logger -p notice -t ZAPRET "Attempt to enable service, but service blocked!"
-				return 61
-			fi
-		fi
-	fi
-	if [ -n "$ZAPRET_CFG_SEC_NAME" ]; then
-		uci set $ZAPRET_CFG_NAME.config.run_on_boot=1
-		uci commit
-	fi
-	/bin/sh /etc/rc.common $ZAPRET_ORIG_INITD enable
+enabled() {
+    /bin/sh /etc/rc.common $ZAPRET_ORIG_INITD enabled
 }
 
-function enabled {
-	local run_on_boot=""
-	if [ -n "$ZAPRET_CFG_SEC_NAME" ]; then
-		run_on_boot=$( get_run_on_boot_option )
-		if [ $run_on_boot != 1 ]; then
-			if [ "$IS_RUN_ON_BOOT" = "1" ]; then
-				logger -p notice -t ZAPRET "Service is blocked!"
-			fi
-			return 61
-		fi
-	fi
-	/bin/sh /etc/rc.common $ZAPRET_ORIG_INITD enabled
+boot() {
+    wait_for_inet
+    init_before_start "$DAEMON_LOG_ENABLE"
+    /bin/sh /etc/rc.common $ZAPRET_ORIG_INITD start "$@"
 }
 
-function boot {
-	local run_on_boot=""
-	patch_luci_header_ut
-	if [ "$IS_RUN_ON_BOOT" = "1" ]; then
-		if [ -n "$ZAPRET_CFG_SEC_NAME" ]; then
-			run_on_boot=$( get_run_on_boot_option )
-			if [ $run_on_boot != 1 ]; then
-				logger -p notice -t ZAPRET "Attempt to run service on boot! Service is blocked!"
-				return 61
-			fi
-		fi
-	fi
-	wait_for_internet
-	init_before_start "$DAEMON_LOG_ENABLE"
-	/bin/sh /etc/rc.common $ZAPRET_ORIG_INITD start "$@"
-	monitor_internet
+start() {
+    wait_for_inet
+    init_before_start "$DAEMON_LOG_ENABLE"
+    /bin/sh /etc/rc.common $ZAPRET_ORIG_INITD start "$@"
 }
 
-function start {
-	wait_for_internet
-	init_before_start "$DAEMON_LOG_ENABLE"
-	/bin/sh /etc/rc.common $ZAPRET_ORIG_INITD start "$@"
-	monitor_internet
+restart() {
+    init_before_start "$DAEMON_LOG_ENABLE"
+    /bin/sh /etc/rc.common $ZAPRET_ORIG_INITD restart "$@"
 }
 
-function restart {
-	init_before_start "$DAEMON_LOG_ENABLE"
-	/bin/sh /etc/rc.common $ZAPRET_ORIG_INITD restart "$@"
+stop() {
+    /bin/sh /etc/rc.common $ZAPRET_ORIG_INITD stop "$@"
 }
+
+# === HOTPLUG integration ===
+add_hotplug_hook() {
+    local hook_file="/etc/hotplug.d/iface/99-zapret"
+    cat <<'EOF' > "$hook_file"
+#!/bin/sh
+[ "$INTERFACE" = "wan" ] || exit 0
+
+case "$ACTION" in
+    ifup)
+        logger -t ZAPRET "WAN is up, restarting zapret..."
+        /etc/init.d/zapret restart
+        ;;
+    ifdown)
+        logger -t ZAPRET "WAN is down, stopping zapret..."
+        /etc/init.d/zapret stop
+        ;;
+esac
+EOF
+    chmod +x "$hook_file"
+}
+
+# Add hotplug-hook in first run
+[ ! -f /etc/hotplug.d/iface/99-zapret ] && add_hotplug_hook
