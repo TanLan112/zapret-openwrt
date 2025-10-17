@@ -1,6 +1,6 @@
 #!/bin/sh /etc/rc.common
 # Copyright (c) 2024 remittor
-# Modified by Anton (2025) — добавлена проверка доступности сети и автоконтроль zapret
+# Modified by Tanlan (2025) — добавлена проверка доступности сети и автоконтроль zapret
 
 USE_PROCD=1
 # after network
